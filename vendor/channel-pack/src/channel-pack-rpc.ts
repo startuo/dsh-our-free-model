@@ -21,6 +21,7 @@ import { isRetiredProvider } from './retired-providers.js'
 import { directFetch } from './direct-fetch.js'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
+import { createDomesticFetch } from './domestic-direct.js'
 import { isGatewayEnabled } from './openai-gateway/config.js'
 import { collectGatewayEffortViews, collectGatewayModels, toGatewayModelIds, type GatewayModelSource } from './openai-gateway/models.js'
 import {
@@ -525,7 +526,16 @@ export async function collectCreditsStatus<TCredential = unknown, TProduct = unk
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsStatusResponse['accounts']> {
-  const fetchStatus = deps.fetchStatus ?? (async () => { throw new Error('该渠道未提供签到状态查询') })
+  // 与 collectClaimResults 同款：显式包装默认实现把 fetcher 送进第三参，
+  // 不用 `as unknown as` 掩盖签名差异（见 CreditsEndpointDeps.fetcher 的说明）。
+  const fetcher = deps.fetcher ?? createDomesticFetch()
+  const fetchStatus = deps.fetchStatus
+    ?? (async (credential: TCredential, product: TProduct): Promise<CheckinStatus | null> =>
+      fetchCheckinStatus(
+        credential as unknown as BuddyCredential,
+        product as unknown as BuddyProduct,
+        fetcher,
+      ))
   const results: RpcCreditsStatusResponse['accounts'] = []
   // 顺序查询，避免并发触发风控
   for (const entry of accounts) {
@@ -561,8 +571,33 @@ export async function collectClaimResults<TCredential = unknown, TProduct = unkn
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsClaimAllResponse> {
-  const fetchStatus = deps.fetchStatus ?? (async () => { throw new Error('该渠道未提供签到状态查询') })
-  const claim = deps.claim ?? (async () => { throw new Error('该渠道未提供签到领取') })
+  // ⚠️ **默认实现必须显式适配，不能 `as unknown as` 硬转。**
+  //
+  // 真实签名是 `(credential, product, fetcher)`，而本接口把 `claim` 声明为
+  // `(credential, product, entry)`（TRAE 需要 `entry.id` 取签到设备代次）。
+  // 历史写法用 `as unknown as` 把这个不匹配「压」过去 —— TypeScript 于是不再
+  // 报错，但调用点传的第三个实参是 `entry`，它落进 `fetcher` 位置，运行时抛
+  // **`TypeError: fetcher is not a function`**。
+  // **真实缺陷**：用户一键领取 4 个 CodeBuddy 账号全部失败，报错就是这句。
+  //
+  // 修法：显式包装 —— 把 `deps.fetcher`（或全局 `fetch`）送进第三参，
+  // `entry` 只交给真正需要它的 provider（它们在自己的分支里注入 `claim`）。
+  const fetcher = deps.fetcher ?? createDomesticFetch()
+  const fetchStatus = deps.fetchStatus
+    ?? (async (credential: TCredential, product: TProduct): Promise<CheckinStatus | null> =>
+      fetchCheckinStatus(
+        credential as unknown as BuddyCredential,
+        product as unknown as BuddyProduct,
+        fetcher,
+      ))
+  const claim = deps.claim
+    ?? (async (credential: TCredential, product: TProduct): Promise<ClaimOutcome> =>
+      claimDailyCheckin(
+        credential as unknown as BuddyCredential,
+        product as unknown as BuddyProduct,
+        fetcher,
+      ))
+  // 默认保留预检（CodeBuddy 系需要）；LobsterAI 显式传 false 跳过。
   const precheck = deps.precheckStatus !== false
   const results: RpcCreditsClaimAllResponse['results'] = []
   const outcomes: ClaimOutcome[] = []
@@ -622,7 +657,15 @@ export async function collectCreditBalances<TCredential = unknown, TProduct = un
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsBalancesResponse['accounts']> {
-  const fetchBalance = deps.fetchBalance ?? (async () => { throw new Error('该渠道未提供余额查询') })
+  // 同 collectClaimResults：显式包装，避免 `as unknown as` 掩盖签名差异。
+  const fetcher = deps.fetcher ?? createDomesticFetch()
+  const fetchBalance = deps.fetchBalance
+    ?? (async (credential: TCredential, product: TProduct): Promise<CreditBalance | null> =>
+      fetchCreditBalance(
+        credential as unknown as BuddyCredential,
+        product as unknown as BuddyProduct,
+        fetcher,
+      ))
   const fetchDetailed = deps.fetchBalanceDetailed
   const results: RpcCreditsBalancesResponse['accounts'] = []
   // 顺序查询，避免并发触发风控
