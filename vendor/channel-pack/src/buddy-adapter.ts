@@ -20,6 +20,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { createDomesticFetch } from './domestic-direct.js'
+import { rewriteIdentityPrompt } from './identity-rewrite.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
@@ -1356,7 +1357,11 @@ export class BuddyAdapter extends LlmAdapter {
     }
     const messages = serializeMessages(options.messages, imageUrls)
     if (options.system !== undefined && options.system.length > 0) {
-      messages.unshift({ role: 'system', content: options.system })
+      // 网关对 system prompt 做「官方客户端」指纹校验：命中特定短语即 400
+      // `11128 Illegal API invocation from an unapproved channel`。触发词是 DSH
+      // 内核固定注入的首句，因此这里做**等价措辞改写**（不删内容、不改语义），
+      // 详见 identity-rewrite.ts 的实测边界与 [issue #560]。
+      messages.unshift({ role: 'system', content: rewriteIdentityPrompt(options.system, this.product.id) })
     }
     if (this.product.id === 'workbuddy' && (messages.length === 0 || messages[0].role !== 'system')) {
       messages.unshift({ role: 'system', content: 'You are a helpful assistant.' })

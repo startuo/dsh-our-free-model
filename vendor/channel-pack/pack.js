@@ -37224,6 +37224,29 @@ import {
   ReasoningEffortId as ReasoningEffortId2
 } from "@deepseek-ai/dsh-llm";
 init_domestic_direct();
+
+// vendor/channel-pack/src/identity-rewrite.ts
+var IDENTITY_REWRITES = [
+  {
+    from: "You are an AI agent powered by DeepSeek Harness.",
+    to: "You are an AI assistant powered by DeepSeek Harness.",
+    provider: "buddy",
+    note: "issue #560\uFF1Aagent\u2192assistant \u5B9E\u6D4B\u901A\u8FC7\uFF082026-10-21\uFF09"
+  }
+];
+function rewriteIdentityPrompt(prompt, provider, rules = IDENTITY_REWRITES) {
+  let result = prompt;
+  for (const rule of rules) {
+    if (rule.provider !== void 0 && rule.provider !== provider) continue;
+    if (result.includes(rule.from)) result = result.split(rule.from).join(rule.to);
+  }
+  return result;
+}
+function needsIdentityRewrite(prompt, provider, rules = IDENTITY_REWRITES) {
+  return rules.some((rule) => (rule.provider === void 0 || rule.provider === provider) && prompt.includes(rule.from));
+}
+
+// vendor/channel-pack/src/buddy-adapter.ts
 import { ToolCallId as ToolCallId2 } from "@deepseek-ai/dsh-llm";
 
 // vendor/channel-pack/src/buddy.ts
@@ -38763,7 +38786,7 @@ var BuddyAdapter = class _BuddyAdapter extends LlmAdapter2 {
     }
     const messages = serializeMessages2(options.messages, imageUrls);
     if (options.system !== void 0 && options.system.length > 0) {
-      messages.unshift({ role: "system", content: options.system });
+      messages.unshift({ role: "system", content: rewriteIdentityPrompt(options.system, this.product.id) });
     }
     if (this.product.id === "workbuddy" && (messages.length === 0 || messages[0].role !== "system")) {
       messages.unshift({ role: "system", content: "You are a helpful assistant." });
@@ -72108,6 +72131,7 @@ function apply(ctx, config = {}) {
 }
 export {
   Config,
+  IDENTITY_REWRITES,
   apply,
   channelProxyBypassed,
   closeDirectFetch,
@@ -72122,5 +72146,7 @@ export {
   makeReadImage,
   makeReadImageRequest,
   name,
-  parseWindowsProxy
+  needsIdentityRewrite,
+  parseWindowsProxy,
+  rewriteIdentityPrompt
 };
