@@ -33376,12 +33376,7 @@ var AccountPool = class {
     return this.readAccounts();
   }
   /**
-   * 清理「凭据域名与当前产品配置不符」的账号。
-   *
-   * 用途：WorkBuddy provider 从中国版（copilot.tencent.com）改造为国际版
-   * （www.workbuddy.ai）后，旧账号存的仍是中国版凭据 —— 它们的
-   * `token.domain` 指向旧端点，用新 endpoint 发请求必然失败（且会一直续期失败）。
-   * 这类条目已无修复价值，直接删除，让用户在 Channel Pack 重新登录。
+   * 清理 domain 与当前产品配置不一致的历史账号。
    *
    * 判据是**凭据里记录的 domain 与产品配置的 apiDomain 不一致**（而不是简单按
    * provider 名删），这样只清理真正失配的条目，不会误删已在新端点登录的账号。
@@ -38015,10 +38010,6 @@ var WORKBUDDY = {
   pluginVersion: "5.5.2",
   fallbackModels: WORKBUDDY_FALLBACK_MODELS
 };
-var ALL_PRODUCTS = [CODEBUDDY, WORKBUDDY];
-function productById(id) {
-  return ALL_PRODUCTS.find((product) => product.id === id);
-}
 function resolveUserAgent(product, model) {
   for (const rule of product.userAgentByModelFamily ?? []) {
     if (model.startsWith(rule.match)) return rule.ua;
@@ -38229,23 +38220,12 @@ function serializeMessages2(messages, imageUrls) {
   return wire;
 }
 function errorMessage2(error) {
-  if (!(error instanceof Error)) {
-    try {
-      return String(error);
-    } catch {
-      return "unknown error";
-    }
+  if (error instanceof Error) return error.message;
+  try {
+    return String(error);
+  } catch {
+    return "unknown error";
   }
-  const parts = [];
-  let current = error;
-  for (let depth = 0; depth < 6 && current instanceof Error; depth++) {
-    const details = current;
-    const code = typeof details.code === "string" && details.code !== "" ? ` [${details.code}]` : "";
-    const text = `${current.name}: ${current.message}${code}`;
-    if (!parts.includes(text)) parts.push(text);
-    current = details.cause;
-  }
-  return parts.length > 0 ? parts.join(" <- ") : error.message;
 }
 function isContentRejection(body) {
   if (body.length === 0) return false;
@@ -47676,7 +47656,6 @@ async function runBuddyLoginFlow(options = {}) {
 }
 
 // vendor/channel-pack/src/buddy-auth.ts
-init_domestic_direct();
 var BUDDY_EXPIRY_ACCESSORS = {
   expiresAtOf: credentialExpiresAtMs,
   refreshableOf: isRefreshable,
@@ -47999,7 +47978,7 @@ var BuddyAuth = class extends Service2 {
   }
   /** 注入的 fetch（测试用）；默认为全局 fetch。 */
   get fetchImpl() {
-    return this.options.fetcher ?? createDomesticFetch();
+    return this.options.fetcher ?? fetch;
   }
 };
 function createPoolRefresh(pool, productId, auth) {
@@ -58993,6 +58972,11 @@ function registerZcodeLlm(ctx, options) {
   return adapter;
 }
 
+// vendor/channel-pack/src/retired-providers.ts
+function isRetiredProvider(provider) {
+  return provider === "buddy" || provider === "workbuddy";
+}
+
 // vendor/channel-pack/src/channel-pack-rpc.ts
 init_domestic_direct();
 import { credentialRef as credentialRef13 } from "@deepseek-ai/dsh-credentials";
@@ -59195,6 +59179,228 @@ async function disposeGatewayRuntime() {
   }
   factory = void 0;
   lastApiKey = null;
+}
+
+// vendor/channel-pack/src/credits.ts
+init_domestic_direct();
+var CHECKIN_ACTIVITY_STATUS_PATH = "/v2/billing/meter/checkin-activity-status";
+var DAILY_CHECKIN_PATH = "/v2/billing/meter/daily-checkin";
+var USER_RESOURCE_PATH = "/v2/billing/meter/get-user-resource";
+var REQUEST_TIMEOUT_MS2 = 3e4;
+var CODE_ALREADY_CLAIMED = 10001;
+var CODE_ALREADY_CLAIMED_ALT = 1001;
+var CODE_NO_QUALIFICATION = 1002;
+var CODE_ACTIVITY_ENDED = 1003;
+function checkinHeaders(credential, product) {
+  const headers = new Headers();
+  headers.set("Authorization", `Bearer ${credential.access_token}`);
+  headers.set("Accept", "application/json");
+  headers.set("Content-Type", "application/json");
+  headers.set(HTTP_HEADER_DOMAIN, product.apiDomain || credential.domain || "");
+  headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE);
+  headers.set(HTTP_HEADER_PRODUCT_CODE, product.productCode);
+  if (credential.user_id !== void 0 && credential.user_id.length > 0) {
+    headers.set("X-User-Id", credential.user_id);
+  }
+  if (credential.enterprise_id !== void 0 && credential.enterprise_id.length > 0) {
+    headers.set("X-Enterprise-Id", credential.enterprise_id);
+    headers.set("X-Tenant-Id", credential.enterprise_id);
+  }
+  headers.set("User-Agent", product.userAgent);
+  return headers;
+}
+function readBool(source, key) {
+  return source[key] === true;
+}
+function readNumber3(source, key) {
+  const value = source[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function readString3(source, key) {
+  const value = source[key];
+  return typeof value === "string" ? value : "";
+}
+function readStringArray(source, key) {
+  const value = source[key];
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+var UNPARSABLE_RESPONSE_MESSAGE = "\u8BF7\u6C42\u5931\u8D25\u6216\u54CD\u5E94\u65E0\u6CD5\u89E3\u6790";
+async function postJson2(path2, credential, product, fetcher) {
+  try {
+    const response = await fetcher(`${product.endpoint}${path2}`, {
+      method: "POST",
+      headers: checkinHeaders(credential, product),
+      body: "{}",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS2)
+    });
+    const text = await response.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return { ok: false, message: describeNonJsonResponse(response.status, text) };
+    }
+    if (typeof parsed !== "object" || parsed === null) {
+      return { ok: false, message: UNPARSABLE_RESPONSE_MESSAGE };
+    }
+    return { ok: true, body: parsed };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  }
+}
+function describeNonJsonResponse(status, text) {
+  if (status === 401 || status === 403) {
+    return `\u51ED\u636E\u5DF2\u5931\u6548\uFF08HTTP ${status}\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u8BE5\u8D26\u53F7`;
+  }
+  const snippet = text.trim().slice(0, 80).replace(/\s+/g, " ");
+  return `\u670D\u52A1\u7AEF\u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08HTTP ${status}\uFF09\uFF1A${snippet}`;
+}
+async function fetchCheckinStatus(credential, product, fetcher = createDomesticFetch()) {
+  const result = await postJson2(CHECKIN_ACTIVITY_STATUS_PATH, credential, product, fetcher);
+  if (!result.ok) return null;
+  const body = result.body;
+  if (body.code !== 0) return null;
+  const data = body.data;
+  if (typeof data !== "object" || data === null) return null;
+  const record = data;
+  return {
+    active: readBool(record, "active"),
+    todayCheckedIn: readBool(record, "today_checked_in"),
+    streakDays: readNumber3(record, "streak_days"),
+    dailyCredit: readNumber3(record, "daily_credit"),
+    todayCredit: readNumber3(record, "today_credit"),
+    isStreakDay: readBool(record, "is_streak_day"),
+    totalCredits: readNumber3(record, "total_credits"),
+    checkinDates: readStringArray(record, "checkin_dates"),
+    activityName: readString3(record, "activity_name"),
+    themeName: readString3(record, "theme_name"),
+    endTime: readString3(record, "end_time")
+  };
+}
+async function claimDailyCheckin(credential, product, fetcher = createDomesticFetch()) {
+  const result = await postJson2(DAILY_CHECKIN_PATH, credential, product, fetcher);
+  if (!result.ok) {
+    return { kind: "failed", code: -1, message: result.message };
+  }
+  const body = result.body;
+  const code = typeof body.code === "number" ? body.code : -1;
+  const message2 = readString3(body, "msg");
+  if (code === CODE_ALREADY_CLAIMED || code === CODE_ALREADY_CLAIMED_ALT) {
+    return { kind: "already-claimed", message: message2.length > 0 ? message2 : "\u4ECA\u5929\u5DF2\u7B7E\u5230" };
+  }
+  if (code === CODE_NO_QUALIFICATION || code === CODE_ACTIVITY_ENDED) {
+    return { kind: "inactive", message: message2.length > 0 ? message2 : "\u5F53\u524D\u65E0\u9886\u53D6\u8D44\u683C" };
+  }
+  if (code !== 0) {
+    return { kind: "failed", code, message: message2.length > 0 ? message2 : "\u9886\u53D6\u5931\u8D25" };
+  }
+  const data = body.data;
+  if (typeof data !== "object" || data === null) {
+    return { kind: "failed", code, message: "\u9886\u53D6\u54CD\u5E94\u7F3A\u5C11 data \u5B57\u6BB5" };
+  }
+  const record = data;
+  const delayed = readString3(record, "message");
+  return {
+    kind: "claimed",
+    credit: readNumber3(record, "credit"),
+    streakDays: readNumber3(record, "streak_days"),
+    isStreakDay: readBool(record, "is_streak_day"),
+    ...delayed.length > 0 ? { delayedMessage: delayed } : {}
+  };
+}
+function readPreciseNumber(source, baseKey) {
+  const precise = source[`${baseKey}Precise`];
+  if (typeof precise === "string") {
+    const parsed = Number.parseFloat(precise);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  if (typeof precise === "number" && Number.isFinite(precise)) return precise;
+  return readNumber3(source, baseKey);
+}
+var PACKAGE_STATUS_EXPIRED = 3;
+function parseCreditPackage(entry) {
+  const name2 = readString3(entry, "PackageName") || readString3(entry, "SubProductName") || readString3(entry, "PackageCode");
+  const unit = readString3(entry, "CapacityUnit") || readString3(entry, "OriginUnit");
+  const status = entry.Status;
+  const expiredTime = readString3(entry, "ExpiredTime");
+  const deductionEndTime = readNumber3(entry, "DeductionEndTime");
+  const expiredAt = expiredTime.length > 0 ? Date.parse(expiredTime.replace(" ", "T")) : Number.NaN;
+  const active = status !== PACKAGE_STATUS_EXPIRED && !(Number.isFinite(expiredAt) && Date.now() >= expiredAt) && !(deductionEndTime > 0 && Date.now() >= deductionEndTime);
+  return {
+    name: name2,
+    unit,
+    remaining: readPreciseNumber(entry, "CycleCapacityRemain"),
+    total: readPreciseNumber(entry, "CycleCapacitySize"),
+    used: readPreciseNumber(entry, "CycleCapacityUsed"),
+    active,
+    cycleStartTime: readString3(entry, "CycleStartTime"),
+    cycleEndTime: readString3(entry, "CycleEndTime"),
+    expiredTime,
+    ...deductionEndTime > 0 ? { deductionEndTime } : {}
+  };
+}
+async function fetchCreditBalance(credential, product, fetcher = createDomesticFetch()) {
+  const result = await postJson2(USER_RESOURCE_PATH, credential, product, fetcher);
+  if (!result.ok) return null;
+  const body = result.body;
+  if (body.code !== 0) return null;
+  const outer = body.data;
+  if (typeof outer !== "object" || outer === null) return null;
+  const response = outer.Response;
+  if (typeof response !== "object" || response === null) return null;
+  const inner = response.Data;
+  if (typeof inner !== "object" || inner === null) return null;
+  const accounts = inner.Accounts;
+  if (!Array.isArray(accounts)) return null;
+  const packages = [];
+  for (const item of accounts) {
+    if (typeof item !== "object" || item === null) continue;
+    packages.push(parseCreditPackage(item));
+  }
+  const total = roundCredits(
+    packages.reduce((sum, pkg) => sum + (pkg.active ? pkg.remaining : 0), 0)
+  );
+  const expiredTotal = roundCredits(
+    packages.reduce((sum, pkg) => sum + (pkg.active ? 0 : pkg.remaining), 0)
+  );
+  return { total, packages, expiredTotal };
+}
+function roundCredits(value) {
+  return Math.round(value * 100) / 100;
+}
+function normalizeCreditUnit(unit) {
+  return unit === "token" ? "token" : "credit";
+}
+function claimUnitOf(unit) {
+  return normalizeCreditUnit(typeof unit === "string" ? unit : "");
+}
+function formatCreditAmount(value) {
+  if (!Number.isFinite(value)) return "?";
+  return Number.isInteger(value) ? String(value) : value.toFixed(2);
+}
+function formatTokenAmount(value) {
+  if (!Number.isFinite(value)) return "?";
+  const abs = Math.abs(value);
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
+  return String(Math.round(value));
+}
+function claimUnitLabel(unit) {
+  return unit === "token" ? "Token" : "\u79EF\u5206";
+}
+function formatUnitAmount(value, unit) {
+  const text = unit === "token" ? formatTokenAmount(value) : formatCreditAmount(value);
+  return `${text}${claimUnitLabel(unit)}`;
+}
+function formatClaimGains(totals) {
+  if (totals === void 0 || totals === null || typeof totals !== "object") return null;
+  const parts = [];
+  for (const unit of ["token", "credit"]) {
+    const value = Number(totals[unit]);
+    if (!Number.isFinite(value) || value <= 0) continue;
+    parts.push(`+${formatUnitAmount(value, unit)}`);
+  }
+  return parts.length === 0 ? null : parts.join(", ");
 }
 
 // vendor/channel-pack/src/buddy-balance-rank.ts
@@ -59436,230 +59642,6 @@ function minimaxFallbackEntries(product = MINIMAX) {
 
 // vendor/channel-pack/src/minimax-credits.ts
 init_domestic_direct();
-
-// vendor/channel-pack/src/credits.ts
-init_domestic_direct();
-var CHECKIN_ACTIVITY_STATUS_PATH = "/v2/billing/meter/checkin-activity-status";
-var DAILY_CHECKIN_PATH = "/v2/billing/meter/daily-checkin";
-var USER_RESOURCE_PATH = "/v2/billing/meter/get-user-resource";
-var REQUEST_TIMEOUT_MS2 = 3e4;
-var CODE_ALREADY_CLAIMED = 10001;
-var CODE_ALREADY_CLAIMED_ALT = 1001;
-var CODE_NO_QUALIFICATION = 1002;
-var CODE_ACTIVITY_ENDED = 1003;
-function checkinHeaders(credential, product) {
-  const headers = new Headers();
-  headers.set("Authorization", `Bearer ${credential.access_token}`);
-  headers.set("Accept", "application/json");
-  headers.set("Content-Type", "application/json");
-  headers.set(HTTP_HEADER_DOMAIN, product.apiDomain || credential.domain || "");
-  headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE);
-  headers.set(HTTP_HEADER_PRODUCT_CODE, product.productCode);
-  if (credential.user_id !== void 0 && credential.user_id.length > 0) {
-    headers.set("X-User-Id", credential.user_id);
-  }
-  if (credential.enterprise_id !== void 0 && credential.enterprise_id.length > 0) {
-    headers.set("X-Enterprise-Id", credential.enterprise_id);
-    headers.set("X-Tenant-Id", credential.enterprise_id);
-  }
-  headers.set("User-Agent", product.userAgent);
-  return headers;
-}
-function readBool(source, key) {
-  return source[key] === true;
-}
-function readNumber3(source, key) {
-  const value = source[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-function readString3(source, key) {
-  const value = source[key];
-  return typeof value === "string" ? value : "";
-}
-function readStringArray(source, key) {
-  const value = source[key];
-  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
-}
-var UNPARSABLE_RESPONSE_MESSAGE = "\u8BF7\u6C42\u5931\u8D25\u6216\u54CD\u5E94\u65E0\u6CD5\u89E3\u6790";
-async function postJson2(path2, credential, product, fetcher) {
-  try {
-    const response = await fetcher(`${product.endpoint}${path2}`, {
-      method: "POST",
-      headers: checkinHeaders(credential, product),
-      body: "{}",
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS2)
-    });
-    const text = await response.text();
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      return { ok: false, message: describeNonJsonResponse(response.status, text) };
-    }
-    if (typeof parsed !== "object" || parsed === null) {
-      return { ok: false, message: UNPARSABLE_RESPONSE_MESSAGE };
-    }
-    return { ok: true, body: parsed };
-  } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : String(error) };
-  }
-}
-function describeNonJsonResponse(status, text) {
-  if (status === 401 || status === 403) {
-    return `\u51ED\u636E\u5DF2\u5931\u6548\uFF08HTTP ${status}\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u8BE5\u8D26\u53F7`;
-  }
-  const snippet = text.trim().slice(0, 80).replace(/\s+/g, " ");
-  return `\u670D\u52A1\u7AEF\u8FD4\u56DE\u4E86\u975E JSON \u54CD\u5E94\uFF08HTTP ${status}\uFF09\uFF1A${snippet}`;
-}
-async function fetchCheckinStatus(credential, product, fetcher = createDomesticFetch()) {
-  const result = await postJson2(CHECKIN_ACTIVITY_STATUS_PATH, credential, product, fetcher);
-  if (!result.ok) return null;
-  const body = result.body;
-  if (body.code !== 0) return null;
-  const data = body.data;
-  if (typeof data !== "object" || data === null) return null;
-  const record = data;
-  return {
-    active: readBool(record, "active"),
-    todayCheckedIn: readBool(record, "today_checked_in"),
-    streakDays: readNumber3(record, "streak_days"),
-    dailyCredit: readNumber3(record, "daily_credit"),
-    todayCredit: readNumber3(record, "today_credit"),
-    isStreakDay: readBool(record, "is_streak_day"),
-    totalCredits: readNumber3(record, "total_credits"),
-    checkinDates: readStringArray(record, "checkin_dates"),
-    activityName: readString3(record, "activity_name"),
-    themeName: readString3(record, "theme_name"),
-    endTime: readString3(record, "end_time")
-  };
-}
-async function claimDailyCheckin(credential, product, fetcher = createDomesticFetch()) {
-  const result = await postJson2(DAILY_CHECKIN_PATH, credential, product, fetcher);
-  if (!result.ok) {
-    return { kind: "failed", code: -1, message: result.message };
-  }
-  const body = result.body;
-  const code = typeof body.code === "number" ? body.code : -1;
-  const message2 = readString3(body, "msg");
-  if (code === CODE_ALREADY_CLAIMED || code === CODE_ALREADY_CLAIMED_ALT) {
-    return { kind: "already-claimed", message: message2.length > 0 ? message2 : "\u4ECA\u5929\u5DF2\u7B7E\u5230" };
-  }
-  if (code === CODE_NO_QUALIFICATION || code === CODE_ACTIVITY_ENDED) {
-    return { kind: "inactive", message: message2.length > 0 ? message2 : "\u5F53\u524D\u65E0\u9886\u53D6\u8D44\u683C" };
-  }
-  if (code !== 0) {
-    return { kind: "failed", code, message: message2.length > 0 ? message2 : "\u9886\u53D6\u5931\u8D25" };
-  }
-  const data = body.data;
-  if (typeof data !== "object" || data === null) {
-    return { kind: "failed", code, message: "\u9886\u53D6\u54CD\u5E94\u7F3A\u5C11 data \u5B57\u6BB5" };
-  }
-  const record = data;
-  const delayed = readString3(record, "message");
-  return {
-    kind: "claimed",
-    credit: readNumber3(record, "credit"),
-    streakDays: readNumber3(record, "streak_days"),
-    isStreakDay: readBool(record, "is_streak_day"),
-    ...delayed.length > 0 ? { delayedMessage: delayed } : {}
-  };
-}
-function readPreciseNumber(source, baseKey) {
-  const precise = source[`${baseKey}Precise`];
-  if (typeof precise === "string") {
-    const parsed = Number.parseFloat(precise);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  if (typeof precise === "number" && Number.isFinite(precise)) return precise;
-  return readNumber3(source, baseKey);
-}
-var PACKAGE_STATUS_EXPIRED = 3;
-function parseCreditPackage(entry) {
-  const name2 = readString3(entry, "PackageName") || readString3(entry, "SubProductName") || readString3(entry, "PackageCode");
-  const unit = readString3(entry, "CapacityUnit") || readString3(entry, "OriginUnit");
-  const status = entry.Status;
-  const expiredTime = readString3(entry, "ExpiredTime");
-  const deductionEndTime = readNumber3(entry, "DeductionEndTime");
-  const expiredAt = expiredTime.length > 0 ? Date.parse(expiredTime.replace(" ", "T")) : Number.NaN;
-  const active = status !== PACKAGE_STATUS_EXPIRED && !(Number.isFinite(expiredAt) && Date.now() >= expiredAt) && !(deductionEndTime > 0 && Date.now() >= deductionEndTime);
-  return {
-    name: name2,
-    unit,
-    remaining: readPreciseNumber(entry, "CycleCapacityRemain"),
-    total: readPreciseNumber(entry, "CycleCapacitySize"),
-    used: readPreciseNumber(entry, "CycleCapacityUsed"),
-    active,
-    cycleStartTime: readString3(entry, "CycleStartTime"),
-    cycleEndTime: readString3(entry, "CycleEndTime"),
-    expiredTime,
-    ...deductionEndTime > 0 ? { deductionEndTime } : {}
-  };
-}
-async function fetchCreditBalance(credential, product, fetcher = createDomesticFetch()) {
-  const result = await postJson2(USER_RESOURCE_PATH, credential, product, fetcher);
-  if (!result.ok) return null;
-  const body = result.body;
-  if (body.code !== 0) return null;
-  const outer = body.data;
-  if (typeof outer !== "object" || outer === null) return null;
-  const response = outer.Response;
-  if (typeof response !== "object" || response === null) return null;
-  const inner = response.Data;
-  if (typeof inner !== "object" || inner === null) return null;
-  const accounts = inner.Accounts;
-  if (!Array.isArray(accounts)) return null;
-  const packages = [];
-  for (const item of accounts) {
-    if (typeof item !== "object" || item === null) continue;
-    packages.push(parseCreditPackage(item));
-  }
-  const total = roundCredits(
-    packages.reduce((sum, pkg) => sum + (pkg.active ? pkg.remaining : 0), 0)
-  );
-  const expiredTotal = roundCredits(
-    packages.reduce((sum, pkg) => sum + (pkg.active ? 0 : pkg.remaining), 0)
-  );
-  return { total, packages, expiredTotal };
-}
-function roundCredits(value) {
-  return Math.round(value * 100) / 100;
-}
-function normalizeCreditUnit(unit) {
-  return unit === "token" ? "token" : "credit";
-}
-function claimUnitOf(unit) {
-  return normalizeCreditUnit(typeof unit === "string" ? unit : "");
-}
-function formatCreditAmount(value) {
-  if (!Number.isFinite(value)) return "?";
-  return Number.isInteger(value) ? String(value) : value.toFixed(2);
-}
-function formatTokenAmount(value) {
-  if (!Number.isFinite(value)) return "?";
-  const abs = Math.abs(value);
-  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
-  return String(Math.round(value));
-}
-function claimUnitLabel(unit) {
-  return unit === "token" ? "Token" : "\u79EF\u5206";
-}
-function formatUnitAmount(value, unit) {
-  const text = unit === "token" ? formatTokenAmount(value) : formatCreditAmount(value);
-  return `${text}${claimUnitLabel(unit)}`;
-}
-function formatClaimGains(totals) {
-  if (totals === void 0 || totals === null || typeof totals !== "object") return null;
-  const parts = [];
-  for (const unit of ["token", "credit"]) {
-    const value = Number(totals[unit]);
-    if (!Number.isFinite(value) || value <= 0) continue;
-    parts.push(`+${formatUnitAmount(value, unit)}`);
-  }
-  return parts.length === 0 ? null : parts.join(", ");
-}
-
-// vendor/channel-pack/src/minimax-credits.ts
 var MINIMAX_SIGNIN_STATUS = Object.freeze({
   Upcoming: 1,
   Claimable: 2,
@@ -62513,23 +62495,15 @@ function isRateLimitFailure(error) {
   return isRateLimited(message2);
 }
 async function probeWithAdapter(entry, credential, modelId, timeoutMs) {
+  if (isRetiredProvider(entry.provider)) throw new Error("provider-retired: WorkBuddy \u6E20\u9053\u5DF2\u79FB\u9664");
   const signal = AbortSignal.timeout(timeoutMs);
   const ref = credentialRef10(entry.credentialRef);
-  const buddyProduct = productById(entry.provider);
   const lobsteraiProduct = lobsteraiProductById(entry.provider);
   const qoderProduct = qoderProductById(entry.provider);
   const clineProduct = clineProductById(entry.provider);
   const zcodeProduct = zcodeProductById(entry.provider);
   let adapter;
-  if (buddyProduct !== void 0) {
-    adapter = new BuddyAdapter({
-      credentialRef: ref,
-      resolveCredential: async () => credential,
-      refresh: async () => {
-      },
-      product: buddyProduct
-    });
-  } else if (lobsteraiProduct !== void 0) {
+  if (lobsteraiProduct !== void 0) {
     adapter = new LobsteraiAdapter({
       credentialRef: ref,
       resolveCredential: async () => credential,
@@ -63073,19 +63047,12 @@ function createBadgePreferenceStore(ctx) {
 }
 
 // vendor/channel-pack/src/badge-subscription.ts
-var PLAN_PACKAGE_PATTERN = /plan|subscription|套餐|体验版/i;
 var BALANCE_PLAN_LABEL = "\u5957\u9910";
-var planPackageSelector = Object.freeze({
-  kind: "package",
-  matches: (name2) => PLAN_PACKAGE_PATTERN.test(name2)
-});
 var qoderPlanSelector = Object.freeze({
   kind: "package",
   matches: (name2) => name2 === QODER_PLAN_PACKAGE
 });
 var BADGE_PLAN_SELECTORS = Object.freeze({
-  buddy: planPackageSelector,
-  workbuddy: planPackageSelector,
   qoder: qoderPlanSelector,
   qodercn: qoderPlanSelector,
   zcode: Object.freeze({ kind: "balance" })
@@ -63571,14 +63538,6 @@ function normalizeZcodeLoginProvider(raw) {
   }
   return ZCODE_LOGIN_PROVIDER;
 }
-function parseBuddyCredential(raw) {
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed === "object" && parsed !== null && typeof parsed.access_token === "string" ? parsed : void 0;
-  } catch {
-    return void 0;
-  }
-}
 function parseCodeArtsCredential(raw) {
   try {
     const parsed = JSON.parse(raw);
@@ -63631,9 +63590,7 @@ function buildRaccoonNickname(credential, fallbackId) {
   return fallbackId;
 }
 var PERMANENT_LOCK_PROVIDERS = /* @__PURE__ */ new Set([
-  LOOMY.id,
-  CODEBUDDY.id,
-  WORKBUDDY.id
+  LOOMY.id
 ]);
 function computeClaimSummary(outcomes) {
   const summary = {
@@ -63826,8 +63783,6 @@ function registerChannelPackRpc(ctx, pool, codearts, buddy, workbuddy, lobsterai
       connectionCtx,
       pool,
       codearts,
-      buddy,
-      workbuddy,
       lobsterai,
       qoder,
       qoderCn,
@@ -63862,7 +63817,7 @@ async function fullCatalogIds(ctx, modelAdapters, provider) {
     return { error: `\u8BFB\u53D6\u6A21\u578B\u5217\u8868\u5931\u8D25\uFF1A${reason}` };
   }
 }
-function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config = {}) {
+function registerChannelPackEndpoints(ctx, pool, codearts, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, gemini, modelAdapters, config = {}) {
   const connection = ctx.connection ?? ctx.get("connection");
   if (!connection || typeof connection.fetch?.register !== "function") {
     ctx.logger.warn("[channel-pack] connection.fetch not available, RPC endpoints not registered");
@@ -63885,7 +63840,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
     store: createAutoCheckinStore(ctx),
     listProviderIds: async () => {
       const accounts = await pool.listAllAccounts();
-      return [...new Set(accounts.map((entry) => entry.provider))].sort();
+      return [...new Set(accounts.filter((entry) => !isRetiredProvider(entry.provider)).map((entry) => entry.provider))].sort();
     },
     claim: (provider) => handleMethod("credits.claimAll", { provider }),
     warn: (message2) => ctx.logger?.warn?.(message2)
@@ -64030,6 +63985,11 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
     };
   }
   async function handleMethod(method, payload, signal) {
+    const request2 = payload !== null && typeof payload === "object" ? payload : void 0;
+    const account = typeof request2?.accountId === "string" ? pool.findAccount(request2.accountId) : void 0;
+    if (isRetiredProvider(request2?.provider) || isRetiredProvider(account?.provider)) {
+      return { ok: false, error: { code: "provider-retired", message: "WorkBuddy \u56FD\u5185\u7248\u548C\u56FD\u9645\u7248\u6E20\u9053\u5DF2\u79FB\u9664\uFF1B\u5386\u53F2\u8D26\u53F7\u51ED\u636E\u4FDD\u6301\u4E0D\u53D8\u3002" } };
+    }
     const codeartsFetcher = (input, init) => {
       const fetcher = config.codeartsFetcher ?? directFetch;
       if (!signal) return fetcher(input, init);
@@ -64061,47 +64021,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         const id = `${provider}-${shortId()}`;
         const suffix = shortId().toUpperCase();
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`;
-        const product = productById(provider);
-        if (product !== void 0) {
-          let state;
-          let authUrl;
-          try {
-            const authState = await fetchAuthState(void 0, void 0, product);
-            state = authState.state;
-            authUrl = decorateLoginUrl(authState.authUrl, product);
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error);
-            throw new Error(`\u65E0\u6CD5\u83B7\u53D6 ${product.displayName} \u767B\u5F55\u5730\u5740\uFF08Host \u7F51\u7EDC\u8BF7\u6C42\u5931\u8D25\uFF09\uFF1A${reason}`);
-          }
-          const ref = credentialRef13(refName);
-          await pool.addAccount({
-            id,
-            provider: product.id,
-            nickname: id,
-            enabled: true,
-            credentialRef: refName,
-            refreshable: false,
-            createdAt: Date.now()
-          });
-          runBuddyLoginFlow({ openBrowser: () => {
-          }, state, product }).then(async (flow) => {
-            await ctx.credentials.set(ref, flow.access);
-            (product.id === CODEBUDDY.id ? buddy : workbuddy).scheduleRefresh();
-            const credential = parseBuddyCredential(flow.access);
-            await pool.updateAccount(id, {
-              nickname: credential?.nickname ?? id,
-              // Buddy 的 expires_at 是字符串形式的毫秒时间戳，
-              // 必须用 credentialExpiresAtMs 解析（Date.parse 对纯数字串会得到 NaN）。
-              expiresAt: credential ? credentialExpiresAtMs(credential) : void 0,
-              refreshable: Boolean(credential?.refresh_token)
-            });
-          }).catch((err) => {
-            ctx.logger.warn(`[channel-pack] background ${product.id} login failed for ${id}: ${err}`);
-            void pool.removeAccount(id).catch(() => {
-            });
-          });
-          return { ok: true, value: { accountId: id, loginUrl: authUrl } };
-        } else if (provider === "codearts") {
+        if (provider === "codearts") {
           const started = await codearts.startLogin({ refName });
           await pool.addAccount({
             id,
@@ -64152,11 +64072,11 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           });
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } };
         } else if (isQoderFamily(provider)) {
-          const { product: product2, auth } = requireQoderFamily(provider);
+          const { product, auth } = requireQoderFamily(provider);
           const started = await auth.startLogin({ refName });
           await pool.addAccount({
             id,
-            provider: product2.id,
+            provider: product.id,
             nickname: id,
             enabled: true,
             credentialRef: refName,
@@ -64167,7 +64087,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             const credential = parseQoderCredential(loginResult.access);
             let nickname = credential?.nickname;
             if ((nickname === void 0 || nickname.length === 0) && credential !== void 0) {
-              nickname = await fetchQoderUserNickname(credential, product2);
+              nickname = await fetchQoderUserNickname(credential, product);
               if (nickname !== void 0 && loginResult.access.length > 0) {
                 const updated = withQoderNickname(credential, nickname);
                 await ctx.credentials.set(credentialRef13(refName), JSON.stringify(updated));
@@ -64179,7 +64099,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
               refreshable: credential !== void 0 && isQoderRefreshable(credential)
             });
           }).catch((error) => {
-            ctx.logger.warn(`[channel-pack] background ${product2.id} login failed for ${id}: ${String(error)}`);
+            ctx.logger.warn(`[channel-pack] background ${product.id} login failed for ${id}: ${String(error)}`);
             void pool.removeAccount(id).catch(() => {
             });
           });
@@ -64497,12 +64417,6 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             case "codearts":
               await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id);
               break;
-            case "buddy":
-              await buddy.refreshAccountCredential(entry.credentialRef, pool, entry.id);
-              break;
-            case "workbuddy":
-              await workbuddy.refreshAccountCredential(entry.credentialRef, pool, entry.id);
-              break;
             case LOBSTERAI.id:
               await lobsterai.refreshAccountCredential(entry.credentialRef, pool, entry.id);
               break;
@@ -64609,8 +64523,8 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             value: { done: false, error: "\u8BF7\u5148\u53D1\u9001\u9A8C\u8BC1\u7801" }
           };
         }
-        const account = pool.findAccount(req.accountId);
-        if (account === void 0) {
+        const account2 = pool.findAccount(req.accountId);
+        if (account2 === void 0) {
           return {
             ok: true,
             value: { done: false, error: "\u8D26\u53F7\u4E0D\u5B58\u5728\uFF08\u53EF\u80FD\u5DF2\u88AB\u5220\u9664\uFF09" }
@@ -64618,7 +64532,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         }
         try {
           const result = await loomy.loginWithSmsCode(pending.phone, req.code, pending.msgid, {
-            refName: account.credentialRef
+            refName: account2.credentialRef
           });
           const credential = JSON.parse(result.access);
           await pool.updateAccount(req.accountId, {
@@ -64651,11 +64565,11 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         if (req.provider !== LOOMY.id && req.provider !== RACCOON.id) {
           return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
         }
-        const account = pool.findAccount(req.accountId);
-        if (account === void 0) {
+        const account2 = pool.findAccount(req.accountId);
+        if (account2 === void 0) {
           return { ok: false, error: { code: "bad-request", message: "\u8D26\u53F7\u4E0D\u5B58\u5728" } };
         }
-        const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+        const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
         if (!resolved) {
           return { ok: false, error: { code: "bad-request", message: "\u51ED\u636E\u672A\u914D\u7F6E" } };
         }
@@ -64723,8 +64637,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         }
         const lockResponse = () => ({
           provider,
-          locked: pool.permanentLocked(provider),
-          ...provider === CODEBUDDY.id || provider === WORKBUDDY.id ? { windowDays: buddyExpiringWindowDays() } : {}
+          locked: pool.permanentLocked(provider)
         });
         if (req.locked === void 0) {
           return { ok: true, value: lockResponse() };
@@ -64751,11 +64664,11 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         if (req.provider !== LOOMY.id && req.provider !== RACCOON.id) {
           return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
         }
-        const account = pool.findAccount(req.accountId);
-        if (account === void 0) {
+        const account2 = pool.findAccount(req.accountId);
+        if (account2 === void 0) {
           return { ok: false, error: { code: "bad-request", message: "\u8D26\u53F7\u4E0D\u5B58\u5728" } };
         }
-        const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+        const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
         if (!resolved) {
           return { ok: false, error: { code: "bad-request", message: "\u51ED\u636E\u672A\u914D\u7F6E" } };
         }
@@ -64799,10 +64712,10 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
       // 重测发一次最小对话请求：正常返回才清除标记，仍受限则保留并回报原因。
       case "account.retest": {
         const req = payload;
-        const account = await retestAccount(pool, req.accountId);
+        const account2 = await retestAccount(pool, req.accountId);
         return {
           ok: true,
-          value: { accounts: [account], clearedCount: account.cleared.length }
+          value: { accounts: [account2], clearedCount: account2.cleared.length }
         };
       }
       // 重测该 provider 下的全部账号。**包含已停用账号**——用户明确要求
@@ -64868,62 +64781,51 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
       // ── 每日签到（积分领取）──
       // 查询某 provider 下全部启用账号的签到状态。
       //
-      // 四个 provider 分属**三套互不相同的协议**，各自在自己的分支里处理：
-      //   - CodeBuddy 系（buddy / workbuddy）：`productById()` 取 BuddyProduct，
-      //     走 `collectCreditsStatus` 的默认实现；
-      //   - `lobsterai`：slot → context 三步，无独立状态端点；
-      //   - `codearts`：华为云 SDK-HMAC-SHA256 签名，无独立状态端点。
-      //
-      // ⚠️ 只有 CodeBuddy 系能经 `productById()` 解析出产品配置；后两者
-      // **必须各自提前分支**，否则会落到下面的 bad-request。历史上 CodeArts
-      // 就是因此恒回 `unsupported provider: codearts`（客户端在面板挂载时
-      // 无条件调用 credits.balances，于是每打开一次设置页都在控制台报错并把
-      // 账号卡片标成查询失败）。现在 CodeArts 已有真实实现，该 bad-request
-      // 只对**未知** provider 生效。
+      // 各渠道显式分派协议，未知或退役渠道不调用任何默认端点。
       case "credits.status": {
         const req = payload;
         if (req.provider === "codearts") {
-          const accounts2 = await pool.listAccounts(req.provider);
+          const accounts = await pool.listAccounts(req.provider);
           return {
             ok: true,
             value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
             }
           };
         }
         if (req.provider === LOBSTERAI.id) {
-          const accounts2 = await pool.listAccounts(req.provider);
+          const accounts = await pool.listAccounts(req.provider);
           return {
             ok: true,
             value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
             }
           };
         }
         if (req.provider === TRAE.id) {
-          const accounts2 = await pool.listAccounts(req.provider);
+          const accounts = await pool.listAccounts(req.provider);
           return {
             ok: true,
             value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
             }
           };
         }
         if (req.provider === CLINE.id) {
-          const accounts2 = await pool.listAccounts(req.provider);
+          const accounts = await pool.listAccounts(req.provider);
           return {
             ok: true,
             value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
             }
           };
         }
         if (req.provider === LOOMY.id) {
-          const accounts2 = await pool.listAccounts(req.provider);
+          const accounts = await pool.listAccounts(req.provider);
           return {
             ok: true,
             value: {
-              accounts: accounts2.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
             }
           };
         }
@@ -64940,53 +64842,44 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           );
           return { ok: true, value: { accounts: value } };
         }
-        const product = productById(req.provider);
-        if (product === void 0) {
-          return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
-        }
-        const accounts = await pool.listAccounts(req.provider);
-        const results = await collectCreditsStatus(accounts, product, {
-          resolve: (ref) => ctx.credentials.resolve(ref),
-          warn: (msg) => ctx.logger?.warn?.(msg)
-        });
-        return { ok: true, value: { accounts: results } };
+        return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
       }
       // 一键领取：逐账号顺序执行（并发易触发风控），单个账号失败不中断整体。
       case "credits.claimAll": {
         const req = payload;
         const accounts = await pool.listAccounts(req.provider);
         if (isQoderFamily(req.provider)) {
-          const { product: product2 } = requireQoderFamily(req.provider);
-          const value2 = await collectClaimResults(accounts, void 0, {
+          const { product } = requireQoderFamily(req.provider);
+          const value = await collectClaimResults(accounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential) => claimQoderDailyCheckin(credential, product2),
+            claim: (credential) => claimQoderDailyCheckin(credential, product),
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
-          return { ok: true, value: value2 };
+          return { ok: true, value };
         }
         if (req.provider === "codearts") {
-          const value2 = await collectClaimResults(accounts, void 0, {
+          const value = await collectClaimResults(accounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             claim: (credential) => claimCodeArtsDailyCheckin(credential, codeartsFetcher),
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
-          return { ok: true, value: value2 };
+          return { ok: true, value };
         }
         if (req.provider === LOBSTERAI.id) {
           const clientVersion = await lobsterai.resolveClientVersion();
-          const value2 = await collectClaimResults(accounts, LOBSTERAI, {
+          const value = await collectClaimResults(accounts, LOBSTERAI, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential, product2) => claimLobsteraiDailyCheckin(credential, product2, clientVersion),
+            claim: (credential, product) => claimLobsteraiDailyCheckin(credential, product, clientVersion),
             // 领取流程内部已做 slot/context 预检，不需要外部再查一次状态。
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
-          return { ok: true, value: value2 };
+          return { ok: true, value };
         }
         if (req.provider === TRAE.id) {
-          const value2 = await collectClaimResults(accounts, void 0, {
+          const value = await collectClaimResults(accounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             // ⚠️ **必须开启状态预检**（`precheckStatus` 默认为 true，不要传 false）。
             //
@@ -65006,16 +64899,16 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             ),
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
-          return { ok: true, value: value2 };
+          return { ok: true, value };
         }
         if (req.provider === LOOMY.id) {
           const values = [];
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+          for (const account2 of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
             if (!resolved) {
               values.push({
-                accountId: account.id,
-                nickname: account.nickname,
+                accountId: account2.id,
+                nickname: account2.nickname,
                 outcome: { kind: "failed", code: -1, message: "\u51ED\u636E\u672A\u914D\u7F6E" }
               });
               continue;
@@ -65025,14 +64918,14 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
               credential = JSON.parse(resolved.value);
             } catch {
               values.push({
-                accountId: account.id,
-                nickname: account.nickname,
+                accountId: account2.id,
+                nickname: account2.nickname,
                 outcome: { kind: "failed", code: -1, message: "\u51ED\u636E\u89E3\u6790\u5931\u8D25" }
               });
               continue;
             }
             const outcome = await loomy.claimDailyQuota(credential);
-            values.push({ accountId: account.id, nickname: account.nickname, outcome });
+            values.push({ accountId: account2.id, nickname: account2.nickname, outcome });
           }
           return {
             ok: true,
@@ -65051,15 +64944,6 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             }
           };
         }
-        if (req.provider === "workbuddy") {
-          return {
-            ok: false,
-            error: {
-              code: "bad-request",
-              message: "WorkBuddy \u56FD\u9645\u7248\u4E0D\u652F\u6301\u6BCF\u65E5\u7B7E\u5230\uFF08\u5176\u540E\u7AEF\u6CA1\u6709\u7B7E\u5230\u63A5\u53E3\uFF09"
-            }
-          };
-        }
         if (req.provider === RACCOON.id) {
           return {
             ok: false,
@@ -65070,19 +64954,19 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           };
         }
         if (req.provider === MINIMAX.id) {
-          const value2 = await collectClaimResults(accounts, void 0, {
+          const value = await collectClaimResults(accounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchStatus: (credential) => fetchMinimaxSigninStatus(credential),
             claim: (credential) => claimMinimaxDailyCheckin(credential),
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
-          return { ok: true, value: value2 };
+          return { ok: true, value };
         }
         if (req.provider === ZCODE.id) {
           const results = [];
           const outcomes = [];
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+          for (const account2 of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
             let accountOutcomes;
             if (!resolved) {
               accountOutcomes = [{ kind: "failed", code: -1, message: "\u51ED\u636E\u672A\u914D\u7F6E" }];
@@ -65102,7 +64986,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
               }
             }
             for (const outcome of accountOutcomes) {
-              results.push({ accountId: account.id, nickname: account.nickname, outcome });
+              results.push({ accountId: account2.id, nickname: account2.nickname, outcome });
               outcomes.push(outcome);
             }
           }
@@ -65111,15 +64995,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             value: { results, summary: computeClaimSummary(outcomes) }
           };
         }
-        const product = productById(req.provider);
-        if (product === void 0) {
-          return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
-        }
-        const value = await collectClaimResults(accounts, product, {
-          resolve: (ref) => ctx.credentials.resolve(ref),
-          warn: (msg) => ctx.logger?.warn?.(msg)
-        });
-        return { ok: true, value };
+        return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
       }
       // 积分余额（Credits Balance）：逐账号顺序查询。
       //
@@ -65130,7 +65006,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         const req = payload;
         const accounts = await pool.listAccounts(req.provider);
         if (req.provider === "codearts") {
-          const values2 = await collectCreditBalances(accounts, void 0, {
+          const values = await collectCreditBalances(accounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalanceDetailed: async (credential) => {
               const result = await fetchCodeArtsAccountInfoDetailed(credential, codeartsFetcher);
@@ -65147,31 +65023,31 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             },
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
         if (req.provider === LOBSTERAI.id) {
-          const values2 = await collectCreditBalances(accounts, LOBSTERAI, {
+          const values = await collectCreditBalances(accounts, LOBSTERAI, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential, product2) => fetchLobsteraiCreditBalance(credential, product2),
+            fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
           return {
             ok: true,
             value: {
-              accounts: values2,
+              accounts: values,
               windowDays: buddyExpiringWindowDays()
             }
           };
         }
         if (isQoderFamily(req.provider)) {
-          const { product: product2 } = requireQoderFamily(req.provider);
-          const values2 = [];
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+          const { product } = requireQoderFamily(req.provider);
+          const values = [];
+          for (const account2 of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
             if (!resolved) {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u672A\u914D\u7F6E"
               });
@@ -65181,32 +65057,32 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             try {
               credential = JSON.parse(resolved.value);
             } catch {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u89E3\u6790\u5931\u8D25"
               });
               continue;
             }
-            const balance = await fetchQoderCreditBalance(credential, product2);
-            values2.push({
-              accountId: account.id,
-              nickname: account.nickname,
+            const balance = await fetchQoderCreditBalance(credential, product);
+            values.push({
+              accountId: account2.id,
+              nickname: account2.nickname,
               balance,
               // 查不到时带上原因，卡片显示原因而非 0（与其它 provider 同约定）。
               ...balance === null ? { error: "\u79EF\u5206\u67E5\u8BE2\u5931\u8D25\uFF08\u51ED\u636E\u5931\u6548\u6216\u54CD\u5E94\u5F02\u5E38\uFF09" } : {}
             });
           }
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
         if (req.provider === OPENCODE.id) {
-          const values2 = accounts.map((account) => {
+          const values = accounts.map((account2) => {
             const now = Date.now();
-            const limits = Object.entries(account.modelRateLimits ?? {});
+            const limits = Object.entries(account2.modelRateLimits ?? {});
             const limitedUntil = limits.reduce((max, [, resetAt]) => Math.max(max, Number(resetAt) || 0), 0);
             const limitedModels = limits.filter(([, resetAt]) => Number(resetAt) > now).length;
-            const available2 = account.enabled && limitedUntil <= now ? 1 : 0;
+            const available2 = account2.enabled && limitedUntil <= now ? 1 : 0;
             const balance = {
               total: available2,
               packages: [{
@@ -65220,41 +65096,41 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
                 cycleEndTime: "",
                 expiredTime: ""
               }],
-              expiredTotal: account.enabled && limitedUntil > now ? 1 : 0
+              expiredTotal: account2.enabled && limitedUntil > now ? 1 : 0
             };
             return {
-              accountId: account.id,
-              nickname: account.nickname,
+              accountId: account2.id,
+              nickname: account2.nickname,
               balance,
-              ...!account.enabled ? { error: "\u5DF2\u505C\u7528" } : limitedUntil > now ? { error: `\u9650\u989D\u4E2D\uFF0C${new Date(limitedUntil).toLocaleString("zh-CN")} \u6062\u590D` } : {}
+              ...!account2.enabled ? { error: "\u5DF2\u505C\u7528" } : limitedUntil > now ? { error: `\u9650\u989D\u4E2D\uFF0C${new Date(limitedUntil).toLocaleString("zh-CN")} \u6062\u590D` } : {}
             };
           });
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
         if (req.provider === TRAE.id) {
-          const values2 = await collectCreditBalances(accounts, TRAE, {
+          const values = await collectCreditBalances(accounts, TRAE, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential, product2) => fetchTraeCreditBalance(credential, product2),
+            fetchBalance: (credential, product) => fetchTraeCreditBalance(credential, product),
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
           return {
             ok: true,
             value: {
-              accounts: values2,
+              accounts: values,
               windowDays: buddyExpiringWindowDays()
             }
           };
         }
         if (req.provider === MINIMAX.id) {
-          const values2 = await collectCreditBalances(accounts, void 0, {
+          const values = await collectCreditBalances(accounts, void 0, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalance: (credential) => fetchMinimaxCreditBalance(credential),
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
         if (req.provider === GEMINI.id) {
-          const values2 = await collectCreditBalances(accounts, GEMINI, {
+          const values = await collectCreditBalances(accounts, GEMINI, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalanceDetailed: async (credential) => {
               const { balance, error, tier } = await fetchGeminiCreditBalance(credential, GEMINI, { force: req.force === true });
@@ -65267,16 +65143,16 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             },
             warn: (msg) => ctx.logger?.warn?.(msg)
           });
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
         if (req.provider === CLINE.id) {
-          const values2 = [];
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+          const values = [];
+          for (const account2 of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
             if (!resolved) {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u672A\u914D\u7F6E"
               });
@@ -65286,18 +65162,18 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             try {
               credential = JSON.parse(resolved.value);
             } catch {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u89E3\u6790\u5931\u8D25"
               });
               continue;
             }
             const result = await fetchClineCreditBalance(credential, CLINE);
-            values2.push({
-              accountId: account.id,
-              nickname: account.nickname,
+            values.push({
+              accountId: account2.id,
+              nickname: account2.nickname,
               balance: result.balance,
               // 查不到时带上**具体原因**（含 HTTP 状态码与错误体摘要），
               // 而不是笼统一句「查询失败」—— 卡片显示原因而非 0
@@ -65305,16 +65181,16 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
               ...result.balance === null ? { error: result.error ?? "\u79EF\u5206\u67E5\u8BE2\u5931\u8D25\uFF08\u51ED\u636E\u5931\u6548\u6216\u54CD\u5E94\u5F02\u5E38\uFF09" } : {}
             });
           }
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
         if (req.provider === LOOMY.id) {
-          const values2 = [];
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+          const values = [];
+          for (const account2 of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
             if (!resolved) {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u672A\u914D\u7F6E"
               });
@@ -65324,33 +65200,33 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             try {
               credential = JSON.parse(resolved.value);
             } catch {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u89E3\u6790\u5931\u8D25"
               });
               continue;
             }
             const balance = await loomy.fetchCreditBalance(credential);
-            values2.push({
-              accountId: account.id,
-              nickname: account.nickname,
+            values.push({
+              accountId: account2.id,
+              nickname: account2.nickname,
               balance,
               // 查不到时带原因（不显示成 0，0 是「已用光」的语义）。
               ...balance === null ? { error: "\u79EF\u5206\u67E5\u8BE2\u5931\u8D25\uFF08\u51ED\u636E\u5931\u6548\u6216\u54CD\u5E94\u5F02\u5E38\uFF09" } : {}
             });
           }
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
         if (req.provider === RACCOON.id) {
-          const values2 = [];
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+          const values = [];
+          for (const account2 of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
             if (!resolved) {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u672A\u914D\u7F6E"
               });
@@ -65360,34 +65236,34 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             try {
               credential = JSON.parse(resolved.value);
             } catch {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u89E3\u6790\u5931\u8D25"
               });
               continue;
             }
             const balance = await raccoon.fetchCreditBalance(credential);
-            values2.push({
-              accountId: account.id,
-              nickname: account.nickname,
+            values.push({
+              accountId: account2.id,
+              nickname: account2.nickname,
               balance,
               // ⚠️ 查不到时带原因（**不显示成 0** —— 0 是「已用光」的语义，
               // 把「查询失败」显示成 0 会让用户以为自己积分没了）。
               ...balance === null ? { error: "\u79EF\u5206\u67E5\u8BE2\u5931\u8D25\uFF08\u51ED\u636E\u5931\u6548\u6216\u54CD\u5E94\u5F02\u5E38\uFF09" } : {}
             });
           }
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
         if (req.provider === ZCODE.id) {
-          const values2 = [];
-          for (const account of accounts) {
-            const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+          const values = [];
+          for (const account2 of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
             if (!resolved) {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u672A\u914D\u7F6E"
               });
@@ -65397,9 +65273,9 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             try {
               credential = JSON.parse(resolved.value);
             } catch {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u51ED\u636E\u89E3\u6790\u5931\u8D25"
               });
@@ -65407,26 +65283,26 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             }
             const result = await zcode.fetchBalanceFor(credential);
             if (result === void 0) {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u989D\u5EA6\u67E5\u8BE2\u5931\u8D25\uFF08\u51ED\u636E\u5931\u6548\u6216\u7F51\u7EDC\u5F02\u5E38\uFF09"
               });
               continue;
             }
             if (result.enterprise === true) {
-              values2.push({
-                accountId: account.id,
-                nickname: account.nickname,
+              values.push({
+                accountId: account2.id,
+                nickname: account2.nickname,
                 balance: null,
                 error: "\u4F01\u4E1A\u7248\u8D26\u53F7\u4E0D\u4E0B\u53D1\u989D\u5EA6\u6570\u5B57\uFF0C\u8BF7\u5728 ZCode \u5185\u67E5\u770B"
               });
               continue;
             }
-            values2.push({
-              accountId: account.id,
-              nickname: account.nickname,
+            values.push({
+              accountId: account2.id,
+              nickname: account2.nickname,
               /**
                * ⚠ `CreditBalance` 的形状是 `{total, packages[], expiredTotal?}`
                * 这类**积分包**结构，而 ZCode 是「按日的 token 额度池」。
@@ -65449,23 +65325,9 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
               balance: buildZcodeBalance(result)
             });
           }
-          return { ok: true, value: { accounts: values2 } };
+          return { ok: true, value: { accounts: values } };
         }
-        const product = productById(req.provider);
-        if (product === void 0) {
-          return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
-        }
-        const values = await collectCreditBalances(accounts, product, {
-          resolve: (ref) => ctx.credentials.resolve(ref),
-          warn: (msg) => ctx.logger?.warn?.(msg)
-        });
-        return {
-          ok: true,
-          value: {
-            accounts: values,
-            windowDays: buddyExpiringWindowDays()
-          }
-        };
+        return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
       }
       // ── Cline「订阅额度」：官方额度窗口 + 请求记录 ──
       //
@@ -65485,12 +65347,12 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         }
         const accounts = await pool.listAccounts(req.provider);
         const values = [];
-        for (const account of accounts) {
-          const resolved = await ctx.credentials.resolve(credentialRef13(account.credentialRef));
+        for (const account2 of accounts) {
+          const resolved = await ctx.credentials.resolve(credentialRef13(account2.credentialRef));
           if (!resolved) {
             values.push({
-              accountId: account.id,
-              nickname: account.nickname,
+              accountId: account2.id,
+              nickname: account2.nickname,
               ok: false,
               windows: [],
               error: "\u51ED\u636E\u672A\u914D\u7F6E"
@@ -65502,8 +65364,8 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             credential = JSON.parse(resolved.value);
           } catch {
             values.push({
-              accountId: account.id,
-              nickname: account.nickname,
+              accountId: account2.id,
+              nickname: account2.nickname,
               ok: false,
               windows: [],
               error: "\u51ED\u636E\u89E3\u6790\u5931\u8D25"
@@ -65512,8 +65374,8 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           }
           const result = await fetchClineUsageLimits(credential, CLINE);
           values.push({
-            accountId: account.id,
-            nickname: account.nickname,
+            accountId: account2.id,
+            nickname: account2.nickname,
             ok: result.ok,
             windows: result.windows,
             // ⚠️ 失败时带上**具体原因**（含 HTTP 状态与网关文案），
@@ -65787,7 +65649,7 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         }
         const statuses = {};
         for (const provider of req.providers) {
-          if (provider.length === 0) continue;
+          if (provider.length === 0 || isRetiredProvider(provider)) continue;
           const catalog = modelAdapters?.[provider]?.listAllModels();
           const total = catalog?.length ?? 0;
           const disabledMap = pool.listDisabledModels(provider);
@@ -66353,39 +66215,6 @@ async function toImageBlock2(url, bridge, limits, already) {
   return { type: "image", attachment: ref };
 }
 
-// vendor/channel-pack/src/openai-gateway/tencent-fingerprint.ts
-var TENCENT_PROVIDERS = ["buddy", "workbuddy"];
-var CONTENT_FINGERPRINTS = [
-  {
-    // ZCode 内建常量：`$Js="Main branch (you will usually use this for PRs)"`。
-    // 每个 git 仓库里的会话都会被注入（拼在 `Main branch … : <分支名>` 这一行）。
-    find: "Main branch (you will usually use this for PRs)",
-    replace: "Main branch (PRs usually go here)",
-    note: "Gitee IKJNA1\uFF1B\u672C\u673A 2026-10-05 \u5BF9 workbuddy / CodeBuddy \u53CC\u7AEF\u70B9\u5B9E\u6D4B\u590D\u73B0"
-  }
-];
-function escapeRegExp(literal) {
-  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-var COMPILED = CONTENT_FINGERPRINTS.map((rule) => ({
-  replace: rule.replace,
-  findLower: rule.find.toLowerCase(),
-  // `g` = 全部出现都改写；`i` = 大小写不敏感（实测全小写 / 全大写同样被拦）。
-  pattern: new RegExp(escapeRegExp(rule.find), "gi")
-}));
-function isTencentContentFingerprintProvider(provider) {
-  return TENCENT_PROVIDERS.includes(provider);
-}
-function rewriteTencentContentFingerprints(text, provider) {
-  if (!isTencentContentFingerprintProvider(provider)) return text;
-  let out = text;
-  for (const rule of COMPILED) {
-    if (!out.toLowerCase().includes(rule.findLower)) continue;
-    out = out.replace(rule.pattern, rule.replace);
-  }
-  return out;
-}
-
 // vendor/channel-pack/src/openai-gateway/messages.ts
 var OpenAiGatewayError = class extends Error {
   constructor(message2, status = 400, type = "invalid_request_error", code = "invalid_request") {
@@ -66525,7 +66354,7 @@ async function convertMessage(raw, provider, model, bridge, limits) {
   if (role === "system") {
     return createGatewayMessage("system", [{
       type: "text",
-      text: rewriteTencentContentFingerprints(textFromContent(value.content), provider)
+      text: textFromContent(value.content)
     }], gatewaySource());
   }
   if (role === "user") {
@@ -67089,7 +66918,7 @@ async function toMessages(input, provider, model, bridge, limits) {
       if (raw.role === "system" || raw.role === "developer") {
         messages.push(createGatewayMessage("system", [{
           type: "text",
-          text: rewriteTencentContentFingerprints(textFromContent(content), provider)
+          text: textFromContent(content)
         }], gatewaySource()));
         continue;
       }
@@ -67177,7 +67006,7 @@ async function toResponsesGenerateOptions(body, signal, reasoningEffortOverride,
     }
     messages.push(createGatewayMessage("system", [{
       type: "text",
-      text: rewriteTencentContentFingerprints(body.instructions, provider)
+      text: body.instructions
     }], gatewaySource()));
   }
   messages.push(...await toMessages(body.input, provider, model, images.bridge, limits));
@@ -68431,7 +68260,6 @@ function createTokenLedgerStore(ctx) {
 }
 
 // vendor/channel-pack/src/buddy-balance-selector.ts
-init_domestic_direct();
 var BUDDY_BALANCE_CACHE_TTL_MS = 6e4;
 var BUDDY_BALANCE_ERROR_CACHE_TTL_MS = 5e3;
 var BuddyBalanceSelector = class {
@@ -68517,7 +68345,7 @@ var BuddyBalanceSelector = class {
     }
     let balance;
     try {
-      balance = await (this.deps.fetchBalance ?? ((cred, product) => fetchCreditBalance(cred, product, this.deps.fetcher ?? createDomesticFetch())))(
+      balance = await (this.deps.fetchBalance ?? ((cred, product) => fetchCreditBalance(cred, product, this.deps.fetcher ?? fetch)))(
         credential,
         this.deps.product
       );

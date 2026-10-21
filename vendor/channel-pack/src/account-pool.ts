@@ -1,6 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { BuddyCredential } from './buddy.js'
+import type { BuddyProduct } from './product.js'
 import { createChannelPackStore, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizePermanentLocks } from './channel-pack-store.js'
 import type { ChannelPackStore, ChannelPackState, ModelDisableMap, PermanentLockMap } from './channel-pack-store.js'
 import { createPermanentLockStore } from './permanent-lock-store.js'
@@ -643,6 +644,38 @@ export class AccountPool {
   /** 列出所有 provider 的账号 */
   async listAllAccounts(): Promise<ProviderAccountEntry[]> {
     return this.readAccounts()
+  }
+
+  /**
+   * 清理 domain 与当前产品配置不一致的历史账号。
+   *
+   * 判据是**凭据里记录的 domain 与产品配置的 apiDomain 不一致**（而不是简单按
+   * provider 名删），这样只清理真正失配的条目，不会误删已在新端点登录的账号。
+   *
+   * @returns 被删除的账号 id 列表（供调用方记日志）。
+   */
+  async pruneAccountsWithForeignDomain(product: BuddyProduct): Promise<string[]> {
+    const removed: string[] = []
+    for (const entry of this.readAccounts()) {
+      if (entry.provider !== product.id) continue
+      let domain = ''
+      try {
+        const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined) continue
+        const parsed = JSON.parse(resolved.value) as { domain?: unknown }
+        domain = typeof parsed.domain === 'string' ? parsed.domain : ''
+      } catch {
+        // 凭据缺失或损坏：留给「凭据未配置」的正常报错路径处理，这里不删
+        continue
+      }
+      // domain 为空表示历史凭据未记录域名，无法判定，保守保留。
+      if (domain.length === 0) continue
+      if (domain !== product.apiDomain) {
+        await this.removeAccount(entry.id)
+        removed.push(entry.id)
+      }
+    }
+    return removed
   }
 
   /** 添加新账号（登录成功后调用） */

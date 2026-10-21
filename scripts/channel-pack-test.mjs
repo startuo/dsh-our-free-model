@@ -106,8 +106,12 @@ const retiredAccounts = ['buddy', 'workbuddy'].map(provider => ({
   id: `${provider}-existing`, provider, nickname: 'Historical', enabled: true, refreshable: true,
   credentialRef: `${provider.toUpperCase()}_ACCOUNT_EXISTING`, createdAt: 1, expiresAt: 1,
 }))
+// 本地保留 WorkBuddy 后，domain 必须与各自产品的 apiDomain 一致，否则挂载时的
+// pruneAccountsWithForeignDomain 会把它们当成「旧版失配账号」清掉。
 const retiredCredentials = retiredAccounts.map(entry => [entry.credentialRef, { value: JSON.stringify({
-  access_token: 'fixture-retired', refresh_token: 'fixture-refresh', domain: 'copilot.tencent.com', expires_at: '1',
+  access_token: 'fixture-retired', refresh_token: 'fixture-refresh',
+  domain: entry.provider === 'workbuddy' ? 'www.workbuddy.ai' : 'copilot.tencent.com',
+  expires_at: '1',
 }) }])
 for (const [ref, value] of retiredCredentials) creds.set(ref, value)
 const state = {
@@ -127,7 +131,7 @@ try {
   apply(ctx, { disableOpencode: true })
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(adapters.has('opencode'), false, 'disabled account provider is not registered')
-  assert.equal(adapters.size, 11, 'all other account providers remain registered')
+  assert.equal(adapters.size, 13, 'all other account providers remain registered (buddy/workbuddy kept locally)')
   verifyChannelImagePricing(adapters)
   console.log('ok  十一渠道同步图片计价：缺失及默认方法兜底，厂商计价优先，重复图片与已卸载图片正确计数')
   assert.equal(writes.length, 0, 'mount neither creates nor deletes credentials')
@@ -155,24 +159,16 @@ try {
   }
   assert.equal((await call('account.list', { provider: 'opencode' })).value.accounts.length, 1)
   assert.equal(writes.length, 0, 'rejected RPCs leave credentials untouched')
+  // 本地保留 WorkBuddy：buddy / workbuddy 是**有效渠道**，不是退役 provider。
+  // 上游移除它们后这段断言的是"退役行为"，移植回来后改为验证注册与凭据保留。
   const beforeRetiredFetch = fetched.length
   for (const entry of retiredAccounts) {
-    assert.equal(adapters.has(entry.provider), false, 'retired provider is never registered')
-    assert.equal(ctx[`${entry.provider}Auth`], undefined, 'retired auth service is never mounted')
-    for (const [method, payload] of [
-      ...['account.create', 'account.list', 'credits.status', 'credits.balances', 'credits.claimAll', 'model.list', 'provider.setEnabled', 'credits.permanentLock'].map(method => [method, { provider: entry.provider }]),
-      ...['account.refresh', 'account.test', 'account.retest', 'account.reset', 'account.update', 'account.delete', 'login.poll'].map(method => [method, { accountId: entry.id }]),
-      ['account.refresh', { provider: 'cline', accountId: entry.id }],
-    ]) {
-      const result = await call(method, payload)
-      assert.equal(result.ok, false, `${entry.provider} ${method}: fails closed`)
-      assert.equal(result.error.code, 'provider-retired')
-    }
-    assert.deepEqual(ctx.accountPool.findAccount(entry.id), entry, 'retired account remains intact')
-    assert.deepEqual(creds.get(entry.credentialRef), retiredCredentials.find(([ref]) => ref === entry.credentialRef)[1])
+    assert.equal(adapters.has(entry.provider), true, `${entry.provider} is registered locally`)
+    assert.deepEqual(ctx.accountPool.findAccount(entry.id), entry, `${entry.provider} historical account intact`)
+    assert.deepEqual(creds.get(entry.credentialRef), retiredCredentials.find(([ref]) => ref === entry.credentialRef)[1], `${entry.provider} credential intact`)
   }
-  assert.equal(writes.length, 0, 'retired requests neither write nor delete credentials')
-  assert.equal(fetched.length, beforeRetiredFetch, 'retired requests never contact upstream')
+  assert.equal(writes.length, 0, 'mount neither writes nor deletes credentials')
+  assert.equal(fetched.length, beforeRetiredFetch, 'mount contacts no upstream')
   // A supported channel proves that the automatic run really executed, rather
   // than asserting an empty state after a skipped/failed run.
   await ctx.accountPool.addAccount({ id: 'automatic-loomy', provider: 'loomy', nickname: 'Auto fixture', enabled: true, refreshable: false, credentialRef: 'AUTO_LOOMY_FIXTURE', createdAt: 1 })
@@ -189,8 +185,8 @@ try {
   }
   assert.equal(automatic.ranToday, true, 'automatic check-in actually completed')
   assert.equal(automatic.running, false)
-  assert.equal(automatic.channels.some(entry => ['buddy', 'workbuddy'].includes(entry.provider)), false, 'retired accounts are not automatic check-in candidates')
-  assert.equal(fetched.length, beforeRetiredFetch, 'automatic check-in sends no retired upstream request')
+  // 本地保留 WorkBuddy：它们是有效渠道，可进入自动签到候选
+  // 本地保留 WorkBuddy 后允许其上游请求
   assert.equal(automaticClaims, 1, 'supported channel actually signed in')
   assert.equal(writes.length, 0, 'startup and automatic check-in preserve all historical credentials')
   ctx.loomyAuth.claimDailyQuota = savedClaim
@@ -276,10 +272,11 @@ try {
     visit(node.children)
   }
   visit(tree)
-  assert.equal(cards.length, 11)
-  for (const provider of ['opencode', 'buddy', 'workbuddy']) assert.equal(cards.includes(provider), false)
+  assert.equal(cards.length, 13)
+  assert.equal(cards.includes('opencode'), false)
+  for (const provider of ['buddy', 'workbuddy']) assert.equal(cards.includes(provider), true, 'WorkBuddy kept locally')
   assert.deepEqual([...cards].sort(), [...adapters.keys()].sort(), 'UI and mounted account providers agree')
-  console.log('ok  actual channel page: 11 account cards, OpenCode and WorkBuddy removed')
+  console.log('ok  actual channel page: 13 account cards, OpenCode removed, WorkBuddy kept')
   await verifyChannelModelActions()
   await verifyChannelCreditsUi()
   console.log('ok  共享渠道余额：十一渠道能力、失败原因、重试、签到反馈和请求交错')

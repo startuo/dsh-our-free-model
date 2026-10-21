@@ -31,6 +31,14 @@ import {
   isGatewayRunning,
   setGatewayDesiredEnabled,
 } from './openai-gateway/runtime.js'
+import type { BuddyAuth } from './buddy-auth.js'
+import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
+import { credentialExpiresAtMs } from './buddy.js'
+import type { BuddyCredential } from './buddy.js'
+import { fetchCreditBalance } from './credits.js'
+import { fetchCheckinStatus } from './credits.js'
+import { claimDailyCheckin } from './credits.js'
+import { CODEBUDDY, WORKBUDDY, productById, type BuddyProduct } from './product.js'
 import type { CodeArtsAuth } from './service.js'
 import type { CodeArtsCredential } from './types.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
@@ -475,6 +483,8 @@ export interface CreditsEndpointDeps<
    * 实现允许抛错，调用方必须把异常算在单个账号头上。
    */
   resolve(ref: CredentialRef): Promise<{ value: string } | undefined>
+  /** 出网实现；默认经 domestic-direct 走国内直连。 */
+  fetcher?: typeof fetch
   /** 查询对应渠道的签到状态。 */
   fetchStatus?: (credential: TCredential, product: TProduct) => Promise<CheckinStatus | null>
   /** 执行对应渠道的签到领取。 */
@@ -817,6 +827,8 @@ export function registerChannelPackRpc(
   ctx: Context,
   pool: AccountPool,
   codearts: CodeArtsAuth,
+  buddy: BuddyAuth,
+  workbuddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
   /** Qoder **中国版**实例（与 `qoder` 同协议、不同 product；RPC 分支按注册表分派）。 */

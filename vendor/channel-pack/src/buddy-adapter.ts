@@ -8,6 +8,7 @@
  * 模型列表：静态默认（对齐 /v3/config craft agent models）+ 登录后的动态拉取
  */
 
+import { gzipSync } from 'node:zlib'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import {
@@ -18,6 +19,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { createDomesticFetch } from './domestic-direct.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
@@ -749,6 +751,15 @@ function sleepMs(ms: number): Promise<void> {
 }
 
 /** 判断是否为传输级错误。 */
+/** 请求体超过此长度才压缩：短请求压缩反而增加 CPU 与首字节延迟。 */
+const COMPRESS_BODY_THRESHOLD = 256 * 1024
+
+/** 传输错误重试次数（不含首次）。 */
+const TRANSPORT_RETRIES = 2
+
+/** 指数退避基准（毫秒）。 */
+const RETRY_BASE_MS = 400
+
 function isTransportError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const message = error.message.toLowerCase()
@@ -862,7 +873,7 @@ export class BuddyAdapter extends LlmAdapter {
     super()
     // 默认 CodeBuddy，保证既有行为完全不变。
     this.product = options.product ?? CODEBUDDY
-    this.fetchImpl = options.fetchImpl ?? fetch
+    this.fetchImpl = options.fetchImpl ?? createDomesticFetch()
     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
     const fallback = this.product.fallbackModels ?? []
     this.productFallbackIndex = new Map(fallback.map((model) => [model.id, model]))
@@ -1794,20 +1805,44 @@ export class BuddyAdapter extends LlmAdapter {
       headers.set('X-Conversation-Message-ID', crypto.randomUUID())
       headers.set('X-Conversation-Request-ID', crypto.randomUUID())
     }
-    try {
-      return await this.fetchImpl(`${this.product.endpoint}/v2/chat/completions`, {
-        method: 'POST',
-        headers,
-        body,
-        signal: options.signal,
-      })
-    } catch (error) {
-      if (options.signal?.aborted) throw error
-      if (isTransportError(error)) {
-        throw new LlmError(`${this.product.id}: transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
+    const url = `${this.product.endpoint}/v2/chat/completions`
+    // 长任务的请求体会随上下文增长；透明代理对单次上传有缓冲上限，超过后直接
+    // 重置连接（实测 2 MB 起 ECONNRESET，同内容 gzip 后仅数 KB 即可通过）。
+    // 压缩只影响传输层，不动会话与缓存语义。
+    let payload: string | Uint8Array = body
+    let payloadHeaders = headers
+    if (Buffer.byteLength(body) >= COMPRESS_BODY_THRESHOLD) {
+      try {
+        const compressed = gzipSync(Buffer.from(body, 'utf8'))
+        if (compressed.byteLength < Buffer.byteLength(body)) {
+          payload = compressed
+          payloadHeaders = new Headers(headers)
+          payloadHeaders.set('Content-Encoding', 'gzip')
+          payloadHeaders.set('Content-Length', String(compressed.byteLength))
+        }
+      } catch {
+        // 压缩失败不是错误：退回明文，让请求按原样发出。
       }
-      throw error
     }
+    // 代理重置是瞬时的，且本请求幂等（同 body、同会话），值得重试而不是直接失败。
+    let lastError: unknown
+    for (let attempt = 0; attempt <= TRANSPORT_RETRIES; attempt++) {
+      try {
+        return await this.fetchImpl(url, {
+          method: 'POST',
+          headers: payloadHeaders,
+          body: payload as NonNullable<RequestInit['body']>,
+          signal: options.signal,
+        })
+      } catch (error) {
+        if (options.signal?.aborted) throw error
+        if (!isTransportError(error)) throw error
+        lastError = error
+        if (attempt === TRANSPORT_RETRIES) break
+        await new Promise(resolve => setTimeout(resolve, RETRY_BASE_MS * 2 ** attempt + Math.random() * 250))
+      }
+    }
+    throw new LlmError(`${this.product.id}: transport error: ${errorMessage(lastError)}`, 'TRANSPORT', { cause: lastError as Error })
   }
 
   /**
